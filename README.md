@@ -1,6 +1,6 @@
 # ESPAlarmClock
 This is our first Home "Thing", an alarm clock.
-The project is started because Tim wants an alarm that works during weektime, but automatically switches of in the weekend.
+The project is started because Tim wants an alarm that works during weektime, but automatically switches off in the weekend.
 
 It is work in progress, but the following features will be implemented:
 - Wifi enabled time, automatic, daylight saving
