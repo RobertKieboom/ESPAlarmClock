@@ -1,117 +1,148 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <ESP8266WiFi.h>
-#include <WiFiUdp.h>
+#include <PubSubClient.h>
 #include "Adafruit_GFX.h"
 #include "Adafruit_LEDBackpack.h"
 #include <RtcDS3231.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
+#include "Time.h"
+#include "TimeAlarms.h"
 
-char ssid[] = "KIBI";                 // Network SSID (name)
-char pass[] = "welkom123";            // Network password
+const char ssid[] = "kibi74";               // Network SSID (name)
+const char password[] = "130872tim250969";  // Network password
+const char* mqtt_server = "192.168.2.8";    // MQTT Server
+#define DEVICE_ID "DEV001"                  // The ID of this device
 
-unsigned int localPort = 2390;        // local port to listen for UDP NTP packets
-IPAddress timeServerIP;               // time.nist.gov NTP server address
-const char* ntpServerName = "time.nist.gov";
-const int NTP_PACKET_SIZE = 48;       // NTP time stamp is in the first 48 bytes of the message
-byte packetBuffer[ NTP_PACKET_SIZE];  // buffer to hold incoming and outgoing packets
-WiFiUDP udp;
-int hourNTPSynced = -1;
+const char* mqtt_observations = "/observations/" DEVICE_ID; // Channel for sensor observations
+const char* mqtt_reqTime = "/time/request/" DEVICE_ID;      // Channel for requesting the time from the server
+const char* mqtt_respTime = "/time/response/" DEVICE_ID;    // Channel for the server time response
 
+WiFiClient wifiClient;
+PubSubClient client(wifiClient);
 Adafruit_BME280 bme;
 Adafruit_7segment display = Adafruit_7segment();
 RtcDS3231 Rtc;
+
 
 void setup() {
   Serial.begin(115200);
   Serial.println("Clock starting!");
 
   display.begin(0x70);
-  showEmptyDisplay();
   Rtc.Begin();
+  setTimeFromRtc();
+  showTime();
 
-  if (!bme.begin()) {  
+  Alarm.timerRepeat(1, showTime);
+
+  if (!bme.begin()) 
     Serial.println("Could not find a valid BME280 sensor, check wiring!");
-    while (1);
-  }
 
-  Serial.print("Connecting to "); Serial.println(ssid);
-  WiFi.begin(ssid, pass);
-  
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(mqtt_callback);
 
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  udp.begin(localPort);
-  Serial.print("UDP local port: ");
-  Serial.println(udp.localPort());
+  Alarm.timerRepeat(1, processMQTT);
+  Alarm.timerRepeat(30, sendSensorValues);
+  Alarm.timerRepeat(300, syncTime);
 }
 
 void loop() {
-  WiFi.hostByName(ntpServerName, timeServerIP); 
+  wait(1000);
+}
 
-  if(hourNTPSynced != Rtc.GetDateTime().Hour()) {
-    Serial.println("Sync Time");
-    sendNTPpacket(timeServerIP); // send an NTP packet to a time server
-  }
-  delay(1000);
+void setTimeFromRtc() {
+  RtcDateTime dt = Rtc.GetDateTime();
+  setTime(dt.Hour(), dt.Minute(), dt.Second(), dt.Day(), dt.Month(), dt.Year());  
+}
 
-  unsigned long epoch = parseNTPPacket();
-  if(epoch > 0) {
-    RtcDateTime now(epoch + 3600);
-    Serial.println("Setting RTC");
-    printDateTime(now);
-    Rtc.SetDateTime(now);
-    hourNTPSynced = now.Hour();
-  }
-
+void showTime() {
   RtcDateTime now = Rtc.GetDateTime();
   displayDateTime(display, now);
-
-  Serial.print("Temperature = ");
-  Serial.print(bme.readTemperature());
-  Serial.println(" *C");
-  
-  Serial.print("Pressure = ");
-  Serial.print(bme.readPressure());
-  Serial.println(" Pa");
-  
-  Serial.print("Humidity = ");
-  Serial.print(bme.readHumidity());
-  Serial.println(" %");
-  
-  Serial.println();
 }
 
-unsigned long parseNTPPacket() {
-  unsigned long epoch = 0;
-  int cb = udp.parsePacket();
-  if (cb) {
-    udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
+void syncTime() {
+  if (client.connected()) {
+    Serial.print("Sync Time Request "); Serial.println(mqtt_reqTime);
+    client.publish(mqtt_reqTime, "");
+  }  
+}
 
-    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
-    // combine the four bytes (two words) into a long integer
-    // this is NTP time (seconds since Jan 1 1900):
-    unsigned long secsSince1900 = highWord << 16 | lowWord;
-    const unsigned long seventyYears = 2208988800UL;
-    epoch = secsSince1900 - seventyYears;
+void sendSensorValues() {
+  char number[15];  
+  char msg[80] = "";
+
+  strcat(msg,"{\"DT\":\"");
+  printDateTime(msg+strlen(msg), Rtc.GetDateTime());
+  strcat(msg,"\",\"T\":");
+  strcat(msg,dtostrf(bme.readTemperature(), 0, 2, number));
+  strcat(msg,",\"P\":");
+  strcat(msg,dtostrf(bme.readPressure(), 0, 2, number));
+  strcat(msg,",\"H\":");
+  strcat(msg,dtostrf(bme.readHumidity(), 0, 2, number));
+  strcat(msg,"}");
+
+  if (client.connected()) {
+    Serial.print("Publish "); Serial.print(mqtt_observations); Serial.print(": "); Serial.println(msg);
+    client.publish(mqtt_observations, msg);
   }
-  return epoch;
 }
 
-void showEmptyDisplay() {
-  for(int i = 0; i < 4; i++)
-    display.writeDigitRaw(i, 0x00);
-  display.drawColon(true);
-  display.writeDisplay();
+void processMQTT() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();  
+}
+
+void setup_wifi() {
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.print(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    wait(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  if(strcmp(topic, mqtt_respTime) == 0) {
+    const char* tm = (const char*) payload;
+    int year = atoi(tm);
+    int month = atoi(tm + 5);
+    int day = atoi(tm + 8);
+    int hour = atoi(tm + 11);
+    int minute = atoi(tm + 14);
+    int second = atoi(tm + 17);
+    RtcDateTime dt(year, month, day, hour, minute, second);
+    Rtc.SetDateTime(dt);
+    setTimeFromRtc();
+    Serial.println("Time Sync done");
+  }
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("ESP8266Client")) {
+      client.subscribe(mqtt_respTime);
+      syncTime();
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.println(client.state());
+    }
+  }
 }
 
 void displayDateTime(Adafruit_7segment& display, const RtcDateTime& dt) {
@@ -125,7 +156,8 @@ void displayDateTime(Adafruit_7segment& display, const RtcDateTime& dt) {
 
   int minute = dt.Minute();
   display.writeDigitNum(3, minute/10, false);
-  display.writeDigitNum(4, minute%10, false);
+  bool isConnected = client.connected();
+  display.writeDigitNum(4, minute%10, isConnected);
 
   int second = dt.Second();
   display.drawColon((second % 2) == 0);
@@ -133,31 +165,18 @@ void displayDateTime(Adafruit_7segment& display, const RtcDateTime& dt) {
   display.writeDisplay();
 }
 
-void printDateTime(const RtcDateTime& dt) {
-  char datestring[25];
-  sprintf_P(datestring, 
-      PSTR("%02u/%02u/%04u %02u:%02u:%02u"),
-      dt.Month(), dt.Day(), dt.Year(),
+void printDateTime(char *dateString, const RtcDateTime& dt) {
+  sprintf_P(dateString, 
+      PSTR("%04u/%02u/%02u %02u:%02u:%02u"),
+      dt.Year(), dt.Month(), dt.Day(),
       dt.Hour(), dt.Minute(), dt.Second() );
-  Serial.println(datestring);
 }
 
-unsigned long sendNTPpacket(IPAddress& address)
-{
-  Serial.println("sending NTP packet...");
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;     // Stratum, or type of clock
-  packetBuffer[2] = 6;     // Polling Interval
-  packetBuffer[3] = 0xEC;  // Peer Clock Precision
-  // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12]  = 49;
-  packetBuffer[13]  = 0x4E;
-  packetBuffer[14]  = 49;
-  packetBuffer[15]  = 52;
-
-  udp.beginPacket(address, 123); //NTP requests are to port 123
-  udp.write(packetBuffer, NTP_PACKET_SIZE);
-  udp.endPacket();
+void wait(unsigned long ms) {
+  unsigned long start = millis();
+  while(millis() < start + ms) {
+    Alarm.delay(1);
+    delay(1);
+  }
 }
 
