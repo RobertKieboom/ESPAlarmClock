@@ -17,5 +17,9 @@ It is work in progress, but the following features will be implemented:
 - Light sensing for setting the brightness of the display
 - USB output to charge a phone/tablet
 
+Below, the current Node-Red flow is shown that runs on the local server.
+
+![alt tag](https://github.com/RobertKieboom/ESPAlarmClock/blob/master/NodeRed-Flow.png?raw=true)
+
 Happy making!
 
