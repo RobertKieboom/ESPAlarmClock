@@ -11,9 +11,9 @@
 #include "TimeAlarms.h"
 #include "DS1307RTC.h"
 
-const char ssid[] = "kibi74";               // Network SSID (name)
-const char password[] = "130872tim250969";  // Network password
-const char* mqtt_server = "192.168.2.8";    // MQTT Server
+const char ssid[] = "KIBI";                 // Network SSID (name)
+const char password[] = "welkom123";        // Network password
+const char* mqtt_server = "192.168.1.104";  // MQTT Server
 #define DEVICE_ID "DEV001"                  // The ID of this device
 
 const char* mqtt_observations = "/observations/" DEVICE_ID;   // Channel for sensor observations
