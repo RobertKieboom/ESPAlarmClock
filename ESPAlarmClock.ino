@@ -7,6 +7,7 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_TSL2561_U.h>
+#include <Adafruit_MCP9808.h>
 #include <Time.h>
 #include <TimeAlarms.h>
 #include <DS1307RTC.h>
@@ -14,26 +15,24 @@
 
 // TODO
 // >- Implement alarm times, switch on the sound
-// - Have a button (or proximity sensor?) to stop the alarm
-// - Create prototype with perfboard and casing
-// - Have a RPI as the home server with Mosquitto, Node-Red and mongoDB
+// >- Have a button (or proximity sensor?) to stop the alarm
+// - Have a RPI as the home server with Mosquitto, Node-Red and mongoDB [static IP on kibi AP]
 // - Store the alarm info on SPIFFS "disk"
 // - Store the Wifi info for all supported AP's on SPIFFS "disk"
 // - When the WIFI router goes down, handle reconnecting to the AP
+// - Logging, where the log is a queue and errors/warnings are sent over MQTT
+// - Have a server socket for logging, including traces
 //
 // - Have a touch LCD (nextion) display? Or a big 7-segment?
 // - Have a way to enter wake time for next day (rotary encoder?)
 // - When alarm is near, grow the light to maximum
 // - Send also installed sensors metadata on connection
-// - Logging, where the log is a queue and errors/warnings are sent over MQTT
-// - Have a server socket for logging, including traces
-// - Check if the BME280 gives correct temperature/humidity readings [try other libraries?]
-// - More precise RTC? [DS3231]
-// - Check if light is really a Lux value
+// >- Check if the BME280 gives correct temperature/humidity readings [Other libraries? Same.. ESP makes the difference?]
 // - Simple discovery and join network/server scenario
 // - How do we solve the fact that the server can be on DHCP; changing server ip addresses?
 // - FOTA
 //
+// * Create prototype with perfboard and casing
 // * Send thing metadata to server (ID, version software, type of hardware) on connection
 // * Have a version number in the software
 // * Allow multiple WIFI SSID/PWD/ServerIP [scanNetworks method didn't work!]
@@ -48,7 +47,7 @@ struct WifiAp {
 };
 
 struct WifiAp wifis[] = {
-  { "KIBI", "welkom123", "192.168.1.102" },
+  { "KIBI", "welkom123", "192.168.1.103" },
   { "kibi74", "130872tim250969", "192.168.2.3" }
 };
 
@@ -58,23 +57,27 @@ char mqtt_reqTime[26] = "/time/request/";       // Channel for requesting the ti
 char mqtt_respTime[26] = "/time/response/";     // Channel for the server time response
 char mqtt_reqAlarm[26] = "/alarm/request/";     // Channel for requesting the alarms from the server
 char mqtt_respAlarm[26] = "/alarm/response/";   // Channel for the server alarms response
+bool alarmIsAllowed = true;
 
 WiFiClient wifiClient;
 PubSubClient client(wifiClient);
 Adafruit_BME280 bme;
 Adafruit_7segment display = Adafruit_7segment();
 Adafruit_TSL2561_Unified tsl = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);
+Adafruit_MCP9808 tempsensor = Adafruit_MCP9808();
+
 ADC_MODE(ADC_VCC);
 
-#define ALARM_PIN 13
-#define SOFTWARE_VERSION "0.1.0"
+#define ALARMOFF_PIN      (12)
+#define ALARM_PIN         (13)
+#define SOFTWARE_VERSION  "0.1.2"
+
 
 void setup() {
   Serial.begin(115200);
   Serial.println("\nClock starting!");
 
-  pinMode(ALARM_PIN, OUTPUT);
-  digitalWrite(ALARM_PIN, LOW);
+  setupIO();
   setupMQTT();
 
   initDisplay();
@@ -83,16 +86,14 @@ void setup() {
   Alarm.timerRepeat(1, showTime);
 
   if (!RTC.chipPresent())
-    Serial.println("Could not find a valid DS1307 Realtime Clock, check wiring!");
+    Serial.println("Couldn't find DS1307!");
   if (!bme.begin()) 
-    Serial.println("Could not find a valid BME280 sensor, check wiring!");
+    Serial.println("Couldn't find BME280!");
   if (!tsl.begin()) 
-    Serial.println("Could not find a valid TSL2561 sensor, check wiring!");
+    Serial.println("Couldn't find TSL2561!");
   tsl.enableAutoRange(true);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
+  if (!tempsensor.begin())
+    Serial.println("Couldn't find MCP9808!");
 
   struct WifiAp* ap = setup_wifi();
   if(ap != NULL) {
@@ -102,7 +103,6 @@ void setup() {
 
   Alarm.timerRepeat(1, processMQTT);
   Alarm.timerRepeat(30, sendSensorValues);
-  Alarm.timerRepeat(30, checkAlarm);
   Alarm.timerRepeat(300, requestTimeFromServer);
 }
 
@@ -116,29 +116,19 @@ void loop() {
 // ======================================================
 
 void initTime() {
-  setSyncProvider(getRtc);
+  RTC.get(); // initialize RTC
   setTimeFromRtc();
-}
-
-time_t getRtc() {
-  if(RTC.chipPresent())
-    return RTC.get();
-  return (time_t)0;
 }
 
 void setRtc(time_t t) {
   setTime(t);
-  if(RTC.chipPresent()) {
+  if(RTC.chipPresent())
     RTC.set(t);
-  }
 }
 
 void setTimeFromRtc() {
-  if(RTC.chipPresent()) {
-    tmElements_t tm;
-    breakTime(RTC.get(), tm);
-    setTime(tm.Hour, tm.Minute, tm.Second, tm.Day, tm.Month, tm.Year);
-  }
+  if(RTC.chipPresent())
+    setTime(RTC.get());
 }
 
 void printDateTime(char *dateString, time_t dt) {
@@ -158,15 +148,28 @@ void printDateTime(char *dateString, tmElements_t tm) {
 }
 
 void checkAlarm() {
-  int wd = weekday();
-
-  if(wd > 1 && wd < 7) {
-    if(hour() == 6 && minute() == 45) {
-      digitalWrite(ALARM_PIN, 1);
-    }
+  if(alarmTimeIsReached()) {
+    if(alarmIsAllowed)
+      digitalWrite(ALARM_PIN, HIGH);
+  } else {
+    alarmIsAllowed = true;
   }
 }
 
+void onAlarmOffButton() {
+  digitalWrite(ALARM_PIN, LOW);
+  alarmIsAllowed = false;
+}
+
+bool alarmTimeIsReached() {
+  int wd = weekday();
+  if(wd > 1 && wd < 7) {
+    if(hour() == 6 && minute() == 45) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // ======================================================
 // Display
@@ -179,14 +182,15 @@ void initDisplay() {
 void showTime() {
   adjustBrightness();
   displayDateTime(display, now());
+  checkAlarm();
 }
 
 void adjustBrightness() {
   sensors_event_t event;
   tsl.getEvent(&event);
   float light = event.light; // 3 - 2000 LUX
-  int brightness = map(light, 0, 1500, 0, 15);
-  display.setBrightness(brightness);
+  int brightness = map(light, 0, 750, 0, 15);
+  display.setBrightness(brightness > 15 ? 15 : brightness);
 }
 
 void displayDateTime(Adafruit_7segment& display, time_t t) {
@@ -229,12 +233,12 @@ void setupMQTT() {
 
 void sendSensorValues() {
   char number[15];  
-  char msg[75];
+  char msg[100];
 
   strcpy(msg,"{\"DT\":\"");
   printDateTime(msg+strlen(msg), now());
   strcat(msg,"\",\"T\":");
-  strcat(msg,dtostrf(bme.readTemperature(), 0, 2, number));
+  strcat(msg,dtostrf(tempsensor.readTempC(), 0, 2, number));
   strcat(msg,",\"P\":");
   strcat(msg,dtostrf(bme.readPressure(), 0, 2, number));
   strcat(msg,",\"H\":");
@@ -242,7 +246,7 @@ void sendSensorValues() {
   strcat(msg,",\"L\":");
   sensors_event_t event;
   tsl.getEvent(&event);
-  strcat(msg,dtostrf(event.light, 0, 2, number));
+  strcat(msg,itoa((int)event.light, number, 10));
   strcat(msg,"}");
   sendObservation(msg);
 
@@ -344,7 +348,7 @@ void reconnect() {
     } else {
       Serial.print("failed, rc=");
       Serial.println(client.state());
-      wait(1000);
+      wait(1000); // not needed anymore because of timed execution?
     }
   }
 }
@@ -371,19 +375,19 @@ void sendMetadata() {
 
   strcat(msg,"{\"SDK\":\"");
   strcat(msg, ESP.getSdkVersion());
-  strcat(msg, "\",\"BVER\":");
+  strcat(msg, "\",\"BV\":");
   itoa(ESP.getBootVersion(), tmp, 10);
   strcat(msg, tmp);
-  strcat(msg, ",\"BMODE\":");
+  strcat(msg, ",\"BM\":");
   itoa(ESP.getBootMode(), tmp, 10);
   strcat(msg, tmp);
   strcat(msg, ",\"FLSH\":");
   itoa(ESP.getFlashChipRealSize()/1024, tmp, 10);
   strcat(msg, tmp);
-  strcat(msg, ",\"SKTCH\":");
+  strcat(msg, ",\"SKZ\":");
   itoa(ESP.getSketchSize()/1024, tmp, 10);
   strcat(msg, tmp);
-  strcat(msg, ",\"SKFREE\":");
+  strcat(msg, ",\"SKF\":");
   itoa(ESP.getFreeSketchSpace()/1024, tmp, 10);
   strcat(msg, tmp);
   strcat(msg, ",\"VER\":\"");
@@ -435,6 +439,13 @@ struct WifiAp* setup_wifi() {
     }
   }
   return NULL;
+}
+
+void setupIO() {
+  pinMode(ALARM_PIN, OUTPUT);
+  digitalWrite(ALARM_PIN, LOW);
+  pinMode(ALARMOFF_PIN, INPUT_PULLUP);
+  attachInterrupt(ALARMOFF_PIN, onAlarmOffButton, FALLING);
 }
 
 void wait(unsigned long ms) {
