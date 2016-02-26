@@ -14,24 +14,37 @@
 #include <ArduinoJson.h>
 
 // TODO
-// >- Implement alarm times, switch on the sound
-// >- Have a button (or proximity sensor?) to stop the alarm
+// *- Create a casing
 // - Have a RPI as the home server with Mosquitto, Node-Red and mongoDB [static IP on kibi AP]
+// - The ESP will keep wifi settings, no need to connect? [investigate]
+//
+// >- Implement alarm times, switch on the sound
 // - Store the alarm info on SPIFFS "disk"
 // - Store the Wifi info for all supported AP's on SPIFFS "disk"
-// - When the WIFI router goes down, handle reconnecting to the AP
+// - When the WIFI router goes down, handle reconnecting to the AP [AP reboot, still worked, investigate further]
+// - Wifi connect could be improved by checking active AP's [why didn't that work in Holten? First check if visible; otherwise try all (like now)]
+// - Have a way to enter wake time for next day, rotary encoder? [next day override]
+// - When alarm is near, grow the light to maximum [waking up light, sun rise emulation]
+//
 // - Logging, where the log is a queue and errors/warnings are sent over MQTT
 // - Have a server socket for logging, including traces
-//
+// - Add a sound sensor? PIR sensor? To detect human presence..
 // - Have a touch LCD (nextion) display? Or a big 7-segment?
-// - Have a way to enter wake time for next day (rotary encoder?)
-// - When alarm is near, grow the light to maximum
 // - Send also installed sensors metadata on connection
-// >- Check if the BME280 gives correct temperature/humidity readings [Other libraries? Same.. ESP makes the difference?]
+// ?- Check if the BME280 gives correct temperature/humidity readings [Other libraries? Same.. ESP makes the difference?]
 // - Simple discovery and join network/server scenario
-// - How do we solve the fact that the server can be on DHCP; changing server ip addresses?
 // - FOTA
+// - Get https://geoiptool.com/:
+//                  <div class="data-item">
+//                    <span class="bold">Local time:</span>
+//                    <span>15 Feb 20:03 (CET+0100)</span>
+//                  </div>
+// - http://freegeoip.net/json [not very responsive??]
 //
+// * Add a pulldown resistor to the FET pin (during flashing it turns on the MP3 player)
+// * Have a button (or proximity sensor?) to stop the alarm
+// * Add a power supply circuit and a 12V adapter (the display is somewhat blinking during WIFI transfers)
+// * Have a big 7-segment display
 // * Create prototype with perfboard and casing
 // * Send thing metadata to server (ID, version software, type of hardware) on connection
 // * Have a version number in the software
@@ -47,7 +60,7 @@ struct WifiAp {
 };
 
 struct WifiAp wifis[] = {
-  { "KIBI", "welkom123", "192.168.1.103" },
+  { "KIBI", "welkom123", "192.168.1.2" },
   { "kibi74", "130872tim250969", "192.168.2.3" }
 };
 
@@ -70,7 +83,7 @@ ADC_MODE(ADC_VCC);
 
 #define ALARMOFF_PIN      (12)
 #define ALARM_PIN         (13)
-#define SOFTWARE_VERSION  "0.1.2"
+#define SOFTWARE_VERSION  "0.1.3"
 
 
 void setup() {
@@ -86,16 +99,16 @@ void setup() {
   Alarm.timerRepeat(1, showTime);
 
   if (!RTC.chipPresent())
-    Serial.println("Couldn't find DS1307!");
+    Serial.println("Couldn't find a DS1307!");
   if (!bme.begin()) 
-    Serial.println("Couldn't find BME280!");
+    Serial.println("Couldn't find a BME280!");
   if (!tsl.begin()) 
-    Serial.println("Couldn't find TSL2561!");
+    Serial.println("Couldn't find a TSL2561!");
   tsl.enableAutoRange(true);
   if (!tempsensor.begin())
-    Serial.println("Couldn't find MCP9808!");
+    Serial.println("Couldn't find a MCP9808!");
 
-  struct WifiAp* ap = setup_wifi();
+  struct WifiAp *ap = setup_wifi();
   if(ap != NULL) {
     client.setServer(ap->server, 1883);
     client.setCallback(mqtt_callback);
@@ -134,23 +147,22 @@ void setTimeFromRtc() {
 void printDateTime(char *dateString, time_t dt) {
   tmElements_t tm;
   breakTime(dt, tm);
-  sprintf_P(dateString, 
-      PSTR("%04u/%02u/%02u %02u:%02u:%02u"),
-      tm.Year + 1970, tm.Month, tm.Day,
-      tm.Hour, tm.Minute, tm.Second );
+  printDateTime(dateString, tm);
 }
 
 void printDateTime(char *dateString, tmElements_t tm) {
   sprintf_P(dateString, 
-      PSTR("%04u/%02u/%02u %02u:%02u:%02u"),
+      PSTR("%04u-%02u-%02uT%02u:%02u:%02u"),
       tm.Year, tm.Month, tm.Day,
       tm.Hour, tm.Minute, tm.Second );
 }
 
 void checkAlarm() {
   if(alarmTimeIsReached()) {
-    if(alarmIsAllowed)
+    if(alarmIsAllowed) {
       digitalWrite(ALARM_PIN, HIGH);
+      Serial.println("ALARM ON");
+    }
   } else {
     alarmIsAllowed = true;
   }
@@ -168,6 +180,10 @@ bool alarmTimeIsReached() {
       return true;
     }
   }
+
+//  if(hour() == 17 && (minute() % 2) == 0)
+//    return true;
+
   return false;
 }
 
@@ -437,6 +453,7 @@ struct WifiAp* setup_wifi() {
       Serial.println(WiFi.localIP());
       return ap;
     }
+    Serial.println();
   }
   return NULL;
 }
